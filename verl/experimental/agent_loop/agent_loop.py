@@ -68,16 +68,58 @@ class AsyncLLMServerManager:
         # LRU cache to map request_id to server
         self.request_id_to_server = LRUCache(maxsize=max_cache_size)
 
-    def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
-        # TODO: implement server pressure awareness load balancing
-        if request_id in self.request_id_to_server:
-            return self.request_id_to_server[request_id]
+        # Load balance strategy and lightweight KV-aware stats (client-side only)
+        agent_cfg = getattr(self.config.actor_rollout_ref.rollout, "agent", {})
+        self.lb_strategy = getattr(agent_cfg, "lb_strategy", "least_requests")
+        self.kv_alpha = float(getattr(agent_cfg, "kv_lb_alpha", 0.5))
 
-        server = self.weighted_serveres[0][1][1]
-        self.weighted_serveres[0][0] += 1
-        heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
+        self._num_servers = len(self.server_handles)
+        self._server_inflight = [0 for _ in range(self._num_servers)]
+        self._server_prompt_ema = [0.0 for _ in range(self._num_servers)]
+        self._ema_decay = 0.3
+        self._max_prompt_seen = 1
+
+        try:
+            self._lock = asyncio.Lock()
+        except RuntimeError:
+            self._lock = None
+
+    def _ensure_lock(self):
+        if self._lock is None:
+            try:
+                self._lock = asyncio.Lock()
+            except RuntimeError:
+                self._lock = None
+
+    async def _choose_server(self, request_id: str, prompt_len: int) -> tuple[int, ray.actor.ActorHandle]:
+        # Sticky session
+        if request_id in self.request_id_to_server:
+            server = self.request_id_to_server[request_id]
+            idx = self.server_handles.index(server)
+            return idx, server
+
+        self._max_prompt_seen = max(self._max_prompt_seen, int(prompt_len))
+
+        if self.lb_strategy != "kv_utilization_aware":
+            server = self.weighted_serveres[0][1][1]
+            self.weighted_serveres[0][0] += 1
+            heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
+            self.request_id_to_server[request_id] = server
+            idx = self.server_handles.index(server)
+            return idx, server
+
+        # kv_utilization_aware: score = inflight + kv_alpha * normalized_prompt_ema
+        norm = float(self._max_prompt_seen)
+        best_idx = 0
+        best_score = float("inf")
+        for i in range(self._num_servers):
+            score = self._server_inflight[i] + self.kv_alpha * (self._server_prompt_ema[i] / norm)
+            if score < best_score or (score == best_score and i < best_idx):
+                best_score = score
+                best_idx = i
+        server = self.server_handles[best_idx]
         self.request_id_to_server[request_id] = server
-        return server
+        return best_idx, server
 
     @rollout_trace_op
     async def generate(
@@ -98,13 +140,31 @@ class AsyncLLMServerManager:
         Returns:
             TokenOutput: token output
         """
-        server = self._choose_server(request_id)
-        output = await server.generate.remote(
-            request_id=request_id,
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            image_data=image_data,
-        )
+        prompt_len = len(prompt_ids)
+        idx, server = await self._choose_server(request_id, prompt_len)
+
+        self._ensure_lock()
+        if self._lock is not None:
+            async with self._lock:
+                self._server_prompt_ema[idx] = self._ema_decay * float(prompt_len) + (1.0 - self._ema_decay) * self._server_prompt_ema[idx]
+                self._server_inflight[idx] += 1
+        else:
+            self._server_prompt_ema[idx] = self._ema_decay * float(prompt_len) + (1.0 - self._ema_decay) * self._server_prompt_ema[idx]
+            self._server_inflight[idx] += 1
+
+        try:
+            output = await server.generate.remote(
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+            )
+        finally:
+            if self._lock is not None:
+                async with self._lock:
+                    self._server_inflight[idx] = max(0, self._server_inflight[idx] - 1)
+            else:
+                self._server_inflight[idx] = max(0, self._server_inflight[idx] - 1)
         return output
 
 
